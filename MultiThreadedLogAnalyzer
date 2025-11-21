@@ -1,0 +1,116 @@
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.*;
+
+public class MultiThreadedLogAnalyzer {
+    public static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            System.out.println("Usage: java MultiThreadedLogAnalyzer <logs_folder> [num_threads]");
+            return;
+        }
+
+        Path folder = Paths.get(args[0]);
+        int threads = args.length > 1 ? Integer.parseInt(args[1]) : 4;
+
+        List<Path> files = Files.list(folder).filter(Files::isRegularFile).collect(Collectors.toList());
+
+        long startSeq = System.nanoTime();
+        Map<String, Integer> seq = analyzeSequential(files);
+        long endSeq = System.nanoTime();
+
+        long startConc = System.nanoTime();
+        Map<String, Integer> conc = analyzeConcurrent(files, threads);
+        long endConc = System.nanoTime();
+
+        System.out.println("Sequential time ms: " + ((endSeq - startSeq) / 1_000_000L));
+        System.out.println("Concurrent time ms: " + ((endConc - startConc) / 1_000_000L));
+
+        System.out.println("Top 30 words (concurrent):");
+        conc.entrySet().stream()
+            .sorted(Map.Entry.<String, Integer>comparingByValue(Comparator.reverseOrder()))
+            .limit(30)
+            .forEach(e -> System.out.println(e.getKey() + " : " + e.getValue()));
+
+        Path out = Paths.get("result.txt");
+        try (BufferedWriter w = Files.newBufferedWriter(out)) {
+            w.write("Sequential time ms: " + ((endSeq - startSeq) / 1_000_000L));
+            w.newLine();
+            w.write("Concurrent time ms: " + ((endConc - startConc) / 1_000_000L));
+            w.newLine();
+            w.write("Top 100 words (concurrent):");
+            w.newLine();
+            conc.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue(Comparator.reverseOrder()))
+                .limit(100)
+                .forEach(e -> {
+                    try {
+                        w.write(e.getKey() + " : " + e.getValue());
+                        w.newLine();
+                    } catch (IOException ex) {
+                        throw new UncheckedIOException(ex);
+                    }
+                });
+        }
+
+        System.out.println("Results written to result.txt");
+    }
+
+    static Map<String, Integer> analyzeSequential(List<Path> files) throws IOException {
+        Map<String, Integer> map = new HashMap<>();
+        for (Path p : files) {
+            try (BufferedReader r = Files.newBufferedReader(p)) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    String[] parts = line.split("\\\\W+");
+                    for (String s : parts) {
+                        if (s.isEmpty()) continue;
+                        String w = s.toLowerCase();
+                        map.put(w, map.getOrDefault(w, 0) + 1);
+                    }
+                }
+            }
+        }
+        return map;
+    }
+
+    static Map<String, Integer> analyzeConcurrent(List<Path> files, int threads) throws Exception {
+        ExecutorService ex = Executors.newFixedThreadPool(threads);
+        try {
+            List<Callable<Map<String, Integer>>> tasks = new ArrayList<>();
+            for (Path p : files) {
+                tasks.add(() -> {
+                    Map<String, Integer> local = new HashMap<>();
+                    try (BufferedReader r = Files.newBufferedReader(p)) {
+                        String line;
+                        while ((line = r.readLine()) != null) {
+                            String[] parts = line.split("\\\\W+");
+                            for (String s : parts) {
+                                if (s.isEmpty()) continue;
+                                String w = s.toLowerCase();
+                                local.put(w, local.getOrDefault(w, 0) + 1);
+                            }
+                        }
+                    }
+                    return local;
+                });
+            }
+
+            List<Future<Map<String, Integer>>> results = ex.invokeAll(tasks);
+            ConcurrentHashMap<String, Integer> agg = new ConcurrentHashMap<>();
+
+            for (Future<Map<String, Integer>> f : results) {
+                Map<String, Integer> m = f.get();
+                for (Map.Entry<String, Integer> e : m.entrySet()) {
+                    agg.merge(e.getKey(), e.getValue(), Integer::sum);
+                }
+            }
+
+            return agg;
+        } finally {
+            ex.shutdown();
+            ex.awaitTermination(1, TimeUnit.MINUTES);
+        }
+    }
+}
